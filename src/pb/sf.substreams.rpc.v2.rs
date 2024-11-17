@@ -41,8 +41,6 @@ pub struct Request {
     /// Available only in developer mode
     #[prost(string, repeated, tag="10")]
     pub debug_initial_store_snapshot_for_modules: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(bool, tag="11")]
-    pub noop_mode: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

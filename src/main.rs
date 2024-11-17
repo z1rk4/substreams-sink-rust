@@ -3,11 +3,13 @@ use chrono::DateTime;
 use futures03::StreamExt;
 use lazy_static::lazy_static;
 use pb::sf::substreams::rpc::v2::{BlockScopedData, BlockUndoSignal};
-use pb::sf::substreams::v1::Package;
+use pb::sf::substreams::v1::{Clock, Package};
+use redis::Commands;
 use regex::Regex;
 use semver::Version;
 
 use prost::Message;
+use serde::{Deserialize, Serialize};
 use std::{env, process::exit, sync::Arc};
 use substreams::SubstreamsEndpoint;
 use substreams_stream::{BlockResponse, SubstreamsStream};
@@ -21,6 +23,13 @@ lazy_static! {
 }
 
 const REGISTRY_URL: &str = "https://spkg.io";
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EosSimpleBlock {
+    pub head_block_id: String,
+    pub head_block_number: u64,
+    pub head_block_time: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -54,7 +63,11 @@ async fn main() -> Result<(), Error> {
     let block_range = read_block_range(&package, &module_name)?;
     let endpoint = Arc::new(SubstreamsEndpoint::new(&endpoint_url, token).await?);
 
-    let cursor: Option<String> = load_persisted_cursor()?;
+    let redis_client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
+    let mut redis_connection = redis_client.get_connection().unwrap();
+    let _: () = redis_connection.set_ex("eos:simple:<blockNumber>", "test", 15).unwrap();
+
+    let cursor: Option<String> = load_persisted_cursor(&mut redis_connection)?;
 
     let mut stream = SubstreamsStream::new(
         endpoint,
@@ -72,12 +85,12 @@ async fn main() -> Result<(), Error> {
                 break;
             }
             Some(Ok(BlockResponse::New(data))) => {
-                process_block_scoped_data(&data)?;
-                persist_cursor(data.cursor)?;
+                process_block_scoped_data(&mut redis_connection, &data)?;
+                persist_cursor(&mut redis_connection, data.cursor)?;
             }
             Some(Ok(BlockResponse::Undo(undo_signal))) => {
                 process_block_undo_signal(&undo_signal)?;
-                persist_cursor(undo_signal.last_valid_cursor)?;
+                persist_cursor(&mut redis_connection, undo_signal.last_valid_cursor)?;
             }
             Some(Err(err)) => {
                 println!();
@@ -91,7 +104,7 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn process_block_scoped_data(data: &BlockScopedData) -> Result<(), Error> {
+fn process_block_scoped_data(connection: &mut redis::Connection, data: &BlockScopedData) -> Result<(), Error> {
     let output = data.output.as_ref().unwrap().map_output.as_ref().unwrap();
 
     // You can decode the actual Any type received using this code:
@@ -107,15 +120,30 @@ fn process_block_scoped_data(data: &BlockScopedData) -> Result<(), Error> {
     let date = DateTime::from_timestamp(timestamp.seconds, timestamp.nanos as u32)
         .expect("received timestamp should always be valid");
 
-    println!(
-        "Block #{} - Payload {} ({} bytes) - Drift {}s",
-        clock.number,
-        output.type_url.replace("type.googleapis.com/", ""),
-        output.value.len(),
-        date.signed_duration_since(chrono::offset::Utc::now())
-            .num_seconds()
-            * -1
-    );
+    let block_number = clock.number;
+    let block_hash = &clock.id;
+    let block_key: String = format!("eos:simple:{}", block_number);
+
+    let block_info = EosSimpleBlock {
+        head_block_id: block_hash.clone(),
+        head_block_number: block_number,
+        head_block_time: timestamp.to_string(),
+    };
+    let block_info_json_string = serde_json::to_string(&block_info).unwrap();
+
+    println!("Block {}: {:}", block_number, block_hash);
+    let _: () = connection.set_ex(block_key, block_info_json_string, 15).unwrap(); // TODO: change to 15 mins TTL
+
+
+    // println!(
+    //     "Block #{} - Payload {} ({} bytes) - Drift {}s",
+    //     clock.number,
+    //     output.type_url.replace("type.googleapis.com/", ""),
+    //     output.value.len(),
+    //     date.signed_duration_since(chrono::offset::Utc::now())
+    //         .num_seconds()
+    //         * -1
+    // );
 
     Ok(())
 }
@@ -130,7 +158,7 @@ fn process_block_undo_signal(_undo_signal: &BlockUndoSignal) -> Result<(), anyho
     unimplemented!("you must implement some kind of block undo handling, or request only final blocks (tweak substreams_stream.rs)")
 }
 
-fn persist_cursor(_cursor: String) -> Result<(), anyhow::Error> {
+fn persist_cursor(connection: &mut redis::Connection, cursor: String) -> Result<(), anyhow::Error> {
     // FIXME: Handling of the cursor is missing here. It should be saved each time
     // a full block has been correctly processed/persisted. The saving location
     // is your responsibility.
@@ -139,14 +167,15 @@ fn persist_cursor(_cursor: String) -> Result<(), anyhow::Error> {
     // going to read it back from database and start back our SubstreamsStream
     // with it ensuring we are continuously streaming without ever losing a single
     // element.
+    connection.set_ex("lootbox:eos:cursor", cursor, 7 * 24 * 60 * 60)?; // 7 days persistence
     Ok(())
 }
 
-fn load_persisted_cursor() -> Result<Option<String>, anyhow::Error> {
+fn load_persisted_cursor(connection: &mut redis::Connection) -> Result<Option<String>, anyhow::Error> {
     // FIXME: Handling of the cursor is missing here. It should be loaded from
     // somewhere (local file, database, cloud storage) and then `SubstreamStream` will
     // be able correctly resume from the right block.
-    Ok(None)
+    connection.get("lootbox:eos:cursor").map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 fn read_block_range(pkg: &Package, module_name: &str) -> Result<(i64, u64), anyhow::Error> {

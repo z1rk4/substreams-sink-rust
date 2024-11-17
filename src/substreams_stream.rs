@@ -74,7 +74,7 @@ fn stream_blocks(
                 start_block_num,
                 start_cursor: latest_cursor.clone(),
                 stop_block_num,
-                final_blocks_only: false,
+                final_blocks_only: true,
                 modules: modules.clone(),
                 output_module: output_module_name.clone(),
                 // There is usually no good reason for you to consume the stream development mode (so switching `true`
@@ -83,7 +83,6 @@ fn stream_blocks(
                 // module.
                 production_mode: true,
                 debug_initial_store_snapshot_for_modules: vec![],
-                noop_mode: false,
             }).await;
 
             match result {
