@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{env, process::exit, sync::Arc};
 use substreams::SubstreamsEndpoint;
 use substreams_stream::{BlockResponse, SubstreamsStream};
+use warp::Filter;
 
 mod pb;
 mod substreams;
@@ -29,6 +30,11 @@ pub struct EosSimpleBlock {
     pub head_block_id: String,
     pub head_block_number: u64,
     pub head_block_time: String,
+}
+
+enum RedisConnection {
+    Cluster(redis::cluster::ClusterConnection),
+    Single(redis::Connection),
 }
 
 #[tokio::main]
@@ -63,9 +69,34 @@ async fn main() -> Result<(), Error> {
     let block_range = read_block_range(&package, &module_name)?;
     let endpoint = Arc::new(SubstreamsEndpoint::new(&endpoint_url, token).await?);
 
-    let redis_client = redis::Client::open("redis://127.0.0.1:6379/").unwrap();
-    let mut redis_connection = redis_client.get_connection().unwrap();
-    let _: () = redis_connection.set_ex("eos:simple:<blockNumber>", "test", 15).unwrap();
+    /* Set up a server for monitoring */
+    let is_healthy_route = warp::path("isHealthy")
+        .and(warp::get())
+        .map(|| warp::reply::json(&true));
+
+    tokio::spawn(async move {
+        warp::serve(is_healthy_route)
+            .run(([127, 0, 0, 1], 3030))
+            .await
+    });
+
+    /* Custom redis handling */
+    let redis_hosts: Vec<String> = env::var("REDIS_HOST")?
+        .split(",")
+        .map(|s| s.to_string())
+        .collect();
+    let mut redis_connection = if redis_hosts.len() > 1 {
+        // TODO: change to hosts len > 0
+        let redis_client = redis::cluster::ClusterClientBuilder::new(redis_hosts)
+            .retries(100)
+            .min_retry_wait(3000)
+            .build()
+            .unwrap();
+        RedisConnection::Cluster(redis_client.get_connection().unwrap())
+    } else {
+        let redis_client = redis::Client::open(redis_hosts.get(0).unwrap().clone()).unwrap();
+        RedisConnection::Single(redis_client.get_connection().unwrap())
+    };
 
     let cursor: Option<String> = load_persisted_cursor(&mut redis_connection)?;
 
@@ -104,8 +135,11 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn process_block_scoped_data(connection: &mut redis::Connection, data: &BlockScopedData) -> Result<(), Error> {
-    let output = data.output.as_ref().unwrap().map_output.as_ref().unwrap();
+fn process_block_scoped_data(
+    connection: &mut RedisConnection,
+    data: &BlockScopedData,
+) -> Result<(), Error> {
+    // let output = data.output.as_ref().unwrap().map_output.as_ref().unwrap();
 
     // You can decode the actual Any type received using this code:
     //
@@ -117,8 +151,8 @@ fn process_block_scoped_data(connection: &mut redis::Connection, data: &BlockSco
 
     let clock = data.clock.as_ref().unwrap();
     let timestamp = clock.timestamp.as_ref().unwrap();
-    let date = DateTime::from_timestamp(timestamp.seconds, timestamp.nanos as u32)
-        .expect("received timestamp should always be valid");
+    // let date = DateTime::from_timestamp(timestamp.seconds, timestamp.nanos as u32)
+    //     .expect("received timestamp should always be valid");
 
     let block_number = clock.number;
     let block_hash = &clock.id;
@@ -131,9 +165,20 @@ fn process_block_scoped_data(connection: &mut redis::Connection, data: &BlockSco
     };
     let block_info_json_string = serde_json::to_string(&block_info).unwrap();
 
-    println!("Block {}: {:}", block_number, block_hash);
-    let _: () = connection.set_ex(block_key, block_info_json_string, 15).unwrap(); // TODO: change to 15 mins TTL
+    match connection {
+        RedisConnection::Cluster(cluster_conn) => {
+            let _: () = cluster_conn
+                .set_ex(block_key, block_info_json_string, 15)
+                .unwrap(); // TODO: change to 15 mins TTL
+        }
+        RedisConnection::Single(single_conn) => {
+            let _: () = single_conn
+                .set_ex(block_key, block_info_json_string, 15)
+                .unwrap(); // TODO: change to 15 mins TTL
+        }
+    }
 
+    println!("Block {}: {:}", block_number, block_hash);
 
     // println!(
     //     "Block #{} - Payload {} ({} bytes) - Drift {}s",
@@ -158,7 +203,7 @@ fn process_block_undo_signal(_undo_signal: &BlockUndoSignal) -> Result<(), anyho
     unimplemented!("you must implement some kind of block undo handling, or request only final blocks (tweak substreams_stream.rs)")
 }
 
-fn persist_cursor(connection: &mut redis::Connection, cursor: String) -> Result<(), anyhow::Error> {
+fn persist_cursor(connection: &mut RedisConnection, cursor: String) -> Result<(), anyhow::Error> {
     // FIXME: Handling of the cursor is missing here. It should be saved each time
     // a full block has been correctly processed/persisted. The saving location
     // is your responsibility.
@@ -167,15 +212,33 @@ fn persist_cursor(connection: &mut redis::Connection, cursor: String) -> Result<
     // going to read it back from database and start back our SubstreamsStream
     // with it ensuring we are continuously streaming without ever losing a single
     // element.
-    connection.set_ex("lootbox:eos:cursor", cursor, 7 * 24 * 60 * 60)?; // 7 days persistence
+    match connection {
+        RedisConnection::Cluster(cluster_conn) => {
+            cluster_conn.set_ex("lootbox:eos:cursor", cursor, 7 * 24 * 60 * 60)?;
+            // 7 days persistence
+        }
+        RedisConnection::Single(single_conn) => {
+            single_conn.set_ex("lootbox:eos:cursor", cursor, 7 * 24 * 60 * 60)?;
+            // 7 days persistence
+        }
+    }
     Ok(())
 }
 
-fn load_persisted_cursor(connection: &mut redis::Connection) -> Result<Option<String>, anyhow::Error> {
+fn load_persisted_cursor(
+    connection: &mut RedisConnection,
+) -> Result<Option<String>, anyhow::Error> {
     // FIXME: Handling of the cursor is missing here. It should be loaded from
     // somewhere (local file, database, cloud storage) and then `SubstreamStream` will
     // be able correctly resume from the right block.
-    connection.get("lootbox:eos:cursor").map_err(|e| anyhow::anyhow!("{}", e))
+    match connection {
+        RedisConnection::Cluster(cluster_conn) => cluster_conn
+            .get("lootbox:eos:cursor")
+            .map_err(|e| anyhow::anyhow!("{}", e)),
+        RedisConnection::Single(single_conn) => single_conn
+            .get("lootbox:eos:cursor")
+            .map_err(|e| anyhow::anyhow!("{}", e)),
+    }
 }
 
 fn read_block_range(pkg: &Package, module_name: &str) -> Result<(i64, u64), anyhow::Error> {
