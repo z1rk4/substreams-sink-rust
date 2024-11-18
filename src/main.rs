@@ -1,9 +1,8 @@
 use anyhow::{format_err, Context, Error};
-use chrono::DateTime;
 use futures03::StreamExt;
 use lazy_static::lazy_static;
 use pb::sf::substreams::rpc::v2::{BlockScopedData, BlockUndoSignal};
-use pb::sf::substreams::v1::{Clock, Package};
+use pb::sf::substreams::v1::Package;
 use redis::Commands;
 use regex::Regex;
 use semver::Version;
