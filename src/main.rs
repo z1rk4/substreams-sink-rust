@@ -1,4 +1,5 @@
 use anyhow::{format_err, Context, Error};
+use dotenv::dotenv;
 use futures03::StreamExt;
 use lazy_static::lazy_static;
 use pb::sf::substreams::rpc::v2::{BlockScopedData, BlockUndoSignal};
@@ -38,6 +39,8 @@ enum RedisConnection {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
+    dotenv().ok();
+
     let args = env::args();
     if args.len() < 4 || args.len() > 5 {
         println!("usage: stream <endpoint> <spkg> <module> [<start>:<stop>]");
