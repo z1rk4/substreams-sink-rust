@@ -1,5 +1,4 @@
 use anyhow::{format_err, Context, Error};
-use dotenv::dotenv;
 use futures03::StreamExt;
 use lazy_static::lazy_static;
 use pb::sf::substreams::rpc::v2::{BlockScopedData, BlockUndoSignal};
@@ -10,7 +9,7 @@ use semver::Version;
 
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::{env, process::exit, sync::Arc};
+use std::{process::exit, sync::Arc};
 use substreams::SubstreamsEndpoint;
 use substreams_stream::{BlockResponse, SubstreamsStream};
 use warp::Filter;
@@ -39,29 +38,17 @@ enum RedisConnection {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    dotenv().ok();
+    dotenvy::dotenv()?;
 
-    let args = env::args();
-    if args.len() < 4 || args.len() > 5 {
-        println!("usage: stream <endpoint> <spkg> <module> [<start>:<stop>]");
-        println!();
-        println!("<spkg> can either be the full spkg.io link or `spkg_package@version`");
-        println!("Example usage: stream mainnet.injective.streamingfast.io:443 injective-common@v0.2.3 all_events 1:10");
-
-        println!("The environment variable SUBSTREAMS_API_TOKEN must be set also");
-        println!("and should contain a valid Substream API token.");
-        exit(1);
-    }
-
-    let mut endpoint_url = env::args().nth(1).unwrap();
-    let package_file = env::args().nth(2).unwrap();
-    let module_name = env::args().nth(3).unwrap();
+    let mut endpoint_url = dotenvy::var("SUBSTREAMS_ENDPOINT_URL").unwrap();
+    let package_file = dotenvy::var("SUBSTREAMS_PACKAGE_FILE").unwrap();
+    let module_name = dotenvy::var("SUBSTREAMS_MODULE").unwrap();
 
     if !endpoint_url.starts_with("http") {
         endpoint_url = format!("{}://{}", "https", endpoint_url);
     }
 
-    let token_env = env::var("SUBSTREAMS_API_TOKEN").unwrap_or("".to_string());
+    let token_env = dotenvy::var("SUBSTREAMS_API_TOKEN").unwrap_or("".to_string());
     let mut token: Option<String> = None;
     if token_env.len() > 0 {
         token = Some(token_env);
@@ -83,7 +70,7 @@ async fn main() -> Result<(), Error> {
     });
 
     /* Custom redis handling */
-    let redis_hosts: Vec<String> = env::var("REDIS_HOST")?
+    let redis_hosts: Vec<String> = dotenvy::var("REDIS_HOST")?
         .split(",")
         .map(|s| s.to_string())
         .collect();
@@ -253,10 +240,7 @@ fn read_block_range(pkg: &Package, module_name: &str) -> Result<(i64, u64), anyh
         .find(|m| m.name == module_name)
         .ok_or_else(|| format_err!("module '{}' not found in package", module_name))?;
 
-    let mut input: String = "".to_string();
-    if let Some(range) = env::args().nth(4) {
-        input = range;
-    };
+    let input: String = dotenvy::var("SUBSTREAMS_BLOCK_RANGE").unwrap_or("".to_string());
 
     let (prefix, suffix) = match input.split_once(":") {
         Some((prefix, suffix)) => (prefix.to_string(), suffix.to_string()),
