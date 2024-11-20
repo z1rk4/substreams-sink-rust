@@ -65,7 +65,7 @@ async fn main() -> Result<(), Error> {
 
     tokio::spawn(async move {
         warp::serve(is_healthy_route)
-            .run(([127, 0, 0, 1], 3030))
+            .run(([127, 0, 0, 1], 3000))
             .await
     });
 
